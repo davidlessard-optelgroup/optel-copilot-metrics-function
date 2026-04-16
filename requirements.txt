@@ -1,0 +1,6 @@
+functions-framework==3.*
+google-cloud-bigquery==3.*
+google-cloud-secret-manager==2.*
+PyJWT==2.*
+cryptography==42.*
+requests==2.*
