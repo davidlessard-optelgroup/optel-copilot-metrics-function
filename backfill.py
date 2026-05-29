@@ -1,136 +1,99 @@
-import jwt
-import time
-import requests
-from google.cloud import bigquery, secretmanager
-from datetime import datetime, timedelta, date
-import json
+"""
+Backfill script — appelle le pipeline Copilot via HTTP pour chaque jour manquant.
 
-PROJECT_ID = "ai-statistics-493215"
-DATASET_ID = "github_copilot"
-APP_ID = "3379809"
-INSTALLATION_ID = "123996873"
-ORG = "optelgroup-copilot"
-SECRET_NAME = f"projects/{PROJECT_ID}/secrets/github-copilot-private-key/versions/latest"
-GH_API_VERSION = "2026-03-10"
+Usage:
+    $env:FUNCTION_URL = "https://copilot-metrics-ys22gj2o3a-uc.a.run.app"
+    python backfill.py
+
+Variables d'environnement:
+    FUNCTION_URL  URL de la Cloud Run Function (obligatoire)
+    NO_AUTH       Si défini (ex: "1"), désactive l'authentification GCP
+"""
+
+import os
+import sys
+import time
+from datetime import date, timedelta
+
+import requests
+
+try:
+    import google.auth.transport.requests
+    import google.oauth2.id_token
+    HAS_GOOGLE_AUTH = True
+except ImportError:
+    HAS_GOOGLE_AUTH = False
+
 
 BACKFILL_START = date(2026, 4, 16)
 BACKFILL_END   = date(2026, 5, 29)  # inclusif
 
-
-def get_private_key():
-    client = secretmanager.SecretManagerServiceClient()
-    response = client.access_secret_version(request={"name": SECRET_NAME})
-    return response.payload.data.decode("UTF-8")
+DELAY_BETWEEN_CALLS = 2  # secondes entre chaque appel
 
 
-def get_installation_token(private_key):
-    now = int(time.time())
-    payload = {"iat": now - 60, "exp": now + 600, "iss": APP_ID}
-    encoded_jwt = jwt.encode(payload, private_key, algorithm="RS256")
-    headers = {"Authorization": f"Bearer {encoded_jwt}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": GH_API_VERSION}
-    url = f"https://api.github.com/app/installations/{INSTALLATION_ID}/access_tokens"
-    response = requests.post(url, headers=headers)
-    response.raise_for_status()
-    return response.json()["token"]
+def get_id_token(url: str) -> str:
+    auth_req = google.auth.transport.requests.Request()
+    return google.oauth2.id_token.fetch_id_token(auth_req, url)
 
 
-def fetch_ndjson(token, endpoint, date_str):
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": GH_API_VERSION}
-    url = f"https://api.github.com/orgs/{ORG}/copilot/metrics/reports/{endpoint}"
-    r = requests.get(url, headers=headers, params={"day": date_str})
-    if r.status_code in [404, 204]:
-        return []
-    r.raise_for_status()
-    links = r.json().get("download_links", [])
-    records = []
-    for link in links:
-        resp = requests.get(link)
-        resp.raise_for_status()
-        for line in resp.text.strip().split("\n"):
-            if line:
-                records.append(json.loads(line))
-    return records
+def call_pipeline(function_url: str, day: date, use_auth: bool) -> bool:
+    payload = {
+        "start_date": day.isoformat(),
+        "end_date":   (day + timedelta(days=1)).isoformat(),
+    }
 
+    headers = {"Content-Type": "application/json"}
+    if use_auth:
+        if not HAS_GOOGLE_AUTH:
+            print("ERREUR: google-auth non installé. Installez avec: pip install google-auth")
+            sys.exit(1)
+        token = get_id_token(function_url)
+        headers["Authorization"] = f"Bearer {token}"
 
-def _delete_day(client, table_id, date_str):
     try:
-        client.query(f"DELETE FROM `{table_id}` WHERE day = DATE '{date_str}'").result()
-        print(f"  Purged {table_id} for {date_str}")
-    except Exception as e:
-        if "streaming buffer" in str(e).lower():
-            print(f"  DELETE skipped for {table_id} (streaming buffer) — inserting anyway.")
+        response = requests.post(function_url, json=payload, headers=headers, timeout=120)
+        if response.status_code == 200:
+            print(f"  OK | {response.text.strip()}")
+            return True
         else:
-            raise
+            print(f"  ERREUR HTTP {response.status_code}: {response.text[:200]}")
+            return False
+    except requests.exceptions.Timeout:
+        print("  ERREUR: timeout (>120s)")
+        return False
+    except requests.exceptions.RequestException as e:
+        print(f"  ERREUR: {e}")
+        return False
 
 
-def insert_org_metrics(records, date_str):
-    client = bigquery.Client(project=PROJECT_ID)
-    table_id = f"{PROJECT_ID}.{DATASET_ID}.daily_org_metrics"
-    _delete_day(client, table_id, date_str)
-    rows = []
-    for r in records:
-        rows.append({"day": date_str, "organization_id": r.get("organization_id", ""), "daily_active_users": r.get("daily_active_users", 0), "daily_active_cli_users": r.get("daily_active_cli_users", 0), "daily_active_copilot_cloud_agent_users": r.get("daily_active_copilot_cloud_agent_users", 0), "weekly_active_users": r.get("weekly_active_users", 0), "monthly_active_users": r.get("monthly_active_users", 0), "monthly_active_chat_users": r.get("monthly_active_chat_users", 0), "monthly_active_agent_users": r.get("monthly_active_agent_users", 0), "user_initiated_interaction_count": r.get("user_initiated_interaction_count", 0), "code_generation_activity_count": r.get("code_generation_activity_count", 0), "code_acceptance_activity_count": r.get("code_acceptance_activity_count", 0)})
-    if rows:
-        client.insert_rows_json(table_id, rows)
-    print(f"  Org: {len(rows)} rows")
-
-
-def insert_user_metrics(records, date_str):
-    client = bigquery.Client(project=PROJECT_ID)
-    _delete_day(client, f"{PROJECT_ID}.{DATASET_ID}.user_daily_by_ide", date_str)
-    _delete_day(client, f"{PROJECT_ID}.{DATASET_ID}.user_language_model", date_str)
-    ide_rows = []
-    model_rows = []
-    for r in records:
-        user_login = r.get("user_login", "")
-        user_id = r.get("user_id", 0)
-        org_id = r.get("organization_id", "")
-        for ide in r.get("totals_by_ide", []):
-            plugin_version = ""
-            ide_version = ""
-            lpv = ide.get("last_known_plugin_version")
-            liv = ide.get("last_known_ide_version")
-            if lpv:
-                plugin_version = lpv.get("plugin_version", "")
-            if liv:
-                ide_version = liv.get("ide_version", "")
-            ide_rows.append({"day": date_str, "user_login": user_login, "user_id": user_id, "organization_id": org_id, "ide": ide.get("ide", ""), "user_initiated_interaction_count": ide.get("user_initiated_interaction_count", 0), "code_generation_activity_count": ide.get("code_generation_activity_count", 0), "code_acceptance_activity_count": ide.get("code_acceptance_activity_count", 0), "loc_suggested_to_add_sum": ide.get("loc_suggested_to_add_sum", 0), "loc_suggested_to_delete_sum": ide.get("loc_suggested_to_delete_sum", 0), "loc_added_sum": ide.get("loc_added_sum", 0), "loc_deleted_sum": ide.get("loc_deleted_sum", 0), "plugin_version": plugin_version, "ide_version": ide_version})
-        for lm in r.get("totals_by_language_model", []):
-            model_rows.append({"day": date_str, "user_login": user_login, "user_id": user_id, "organization_id": org_id, "language": lm.get("language", ""), "model": lm.get("model", ""), "code_generation_activity_count": lm.get("code_generation_activity_count", 0), "code_acceptance_activity_count": lm.get("code_acceptance_activity_count", 0), "loc_suggested_to_add_sum": lm.get("loc_suggested_to_add_sum", 0), "loc_suggested_to_delete_sum": lm.get("loc_suggested_to_delete_sum", 0), "loc_added_sum": lm.get("loc_added_sum", 0), "loc_deleted_sum": lm.get("loc_deleted_sum", 0)})
-    if ide_rows:
-        client.insert_rows_json(f"{PROJECT_ID}.{DATASET_ID}.user_daily_by_ide", ide_rows)
-    if model_rows:
-        client.insert_rows_json(f"{PROJECT_ID}.{DATASET_ID}.user_language_model", model_rows)
-    print(f"  Users: {len(ide_rows)} ide rows, {len(model_rows)} model rows")
-
-
-if __name__ == "__main__":
+def main():
+    function_url = os.environ.get("FUNCTION_URL", "https://copilot-metrics-ys22gj2o3a-uc.a.run.app").strip()
+    use_auth = not os.environ.get("NO_AUTH")
     total = (BACKFILL_END - BACKFILL_START).days + 1
-    print(f"Backfill Copilot metrics de {BACKFILL_START} à {BACKFILL_END} ({total} jour(s))")
-
-    private_key = get_private_key()
-    token = get_installation_token(private_key)
-    token_time = time.time()
-
     failed = []
-    for i in range(total):
-        current = BACKFILL_START + timedelta(days=i)
-        date_str = current.isoformat()
-        print(f"[{i + 1}/{total}] {date_str}")
-        try:
-            if time.time() - token_time > 2900:
-                token = get_installation_token(private_key)
-                token_time = time.time()
-            org_records = fetch_ndjson(token, "organization-1-day", date_str)
-            insert_org_metrics(org_records, date_str)
-            user_records = fetch_ndjson(token, "users-1-day", date_str)
-            insert_user_metrics(user_records, date_str)
-        except Exception as e:
-            print(f"  ERREUR: {e}")
-            failed.append(date_str)
 
-    print(f"\nTerminé. {total - len(failed)}/{total} jours réussis.")
+    print(f"Backfill Copilot metrics de {BACKFILL_START} à {BACKFILL_END} ({total} jour(s))")
+    print(f"URL: {function_url}")
+    print(f"Auth GCP: {'activée' if use_auth else 'désactivée'}")
+    print()
+
+    for i in range(total):
+        day = BACKFILL_START + timedelta(days=i)
+        print(f"[{i + 1}/{total}] {day.isoformat()} ...", end=" ", flush=True)
+        success = call_pipeline(function_url, day, use_auth)
+        if not success:
+            failed.append(day.isoformat())
+        if i < total - 1:
+            time.sleep(DELAY_BETWEEN_CALLS)
+
+    print()
+    print(f"Terminé. {total - len(failed)}/{total} jours réussis.")
     if failed:
         print(f"Jours en échec ({len(failed)}):")
         for d in failed:
             print(f"  - {d}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
