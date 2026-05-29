@@ -54,8 +54,21 @@ def fetch_ndjson(token, endpoint, date):
                 records.append(json.loads(line))
     return records
 
+def _delete_day(client, table_id, date):
+    try:
+        client.query(f"DELETE FROM `{table_id}` WHERE day = DATE '{date}'").result()
+        print(f"  Purged {table_id} for {date}")
+    except Exception as e:
+        if "streaming buffer" in str(e).lower():
+            print(f"  DELETE skipped for {table_id} (streaming buffer) — inserting anyway.")
+        else:
+            raise
+
+
 def insert_org_metrics(records, date):
     client = bigquery.Client(project=PROJECT_ID)
+    table_id = f"{PROJECT_ID}.{DATASET_ID}.daily_org_metrics"
+    _delete_day(client, table_id, date)
     rows = []
     for r in records:
         rows.append({
@@ -73,13 +86,15 @@ def insert_org_metrics(records, date):
             "code_acceptance_activity_count": r.get("code_acceptance_activity_count", 0)
         })
     if rows:
-        errors = client.insert_rows_json(f"{PROJECT_ID}.{DATASET_ID}.daily_org_metrics", rows)
+        errors = client.insert_rows_json(table_id, rows)
         if errors:
             print(f"daily_org_metrics errors: {errors}")
     print(f"  Org metrics: {len(rows)} rows")
 
 def insert_user_metrics(records, date):
     client = bigquery.Client(project=PROJECT_ID)
+    _delete_day(client, f"{PROJECT_ID}.{DATASET_ID}.user_daily_by_ide", date)
+    _delete_day(client, f"{PROJECT_ID}.{DATASET_ID}.user_language_model", date)
     ide_rows = []
     model_rows = []
     for r in records:
@@ -138,12 +153,13 @@ def insert_user_metrics(records, date):
 
 @functions_framework.http
 def main(request):
-    yesterday = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
-    print(f"Fetching Copilot metrics for {yesterday}")
+    body = request.get_json(silent=True) or {}
+    date = body.get("start_date") or (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+    print(f"Fetching Copilot metrics for {date}")
     private_key = get_private_key()
     token = get_installation_token(private_key)
-    org_records = fetch_ndjson(token, "organization-1-day", yesterday)
-    insert_org_metrics(org_records, yesterday)
-    user_records = fetch_ndjson(token, "users-1-day", yesterday)
-    insert_user_metrics(user_records, yesterday)
-    return f"OK - {yesterday}", 200
+    org_records = fetch_ndjson(token, "organization-1-day", date)
+    insert_org_metrics(org_records, date)
+    user_records = fetch_ndjson(token, "users-1-day", date)
+    insert_user_metrics(user_records, date)
+    return f"OK - {date}", 200
